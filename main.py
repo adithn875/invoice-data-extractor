@@ -1,73 +1,313 @@
+from __future__ import annotations
+
+import argparse
 import os
 import re
-import pytesseract
-import cv2
-from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment
+import shutil
+import sys
+from dataclasses import dataclass, asdict
 from datetime import datetime
+from pathlib import Path
+from typing import Iterable
 
-# ✅ Set Tesseract path
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe'
 
-# ✅ Preprocess image for better OCR results
-def preprocess_image(img_path):
-    image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    image = cv2.resize(image, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
-    image = cv2.GaussianBlur(image, (5, 5), 0)
-    _, image = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+
+@dataclass
+class InvoiceData:
+    filename: str
+    invoice_number: str = ""
+    date: str = ""
+    subtotal: str = ""
+    tax: str = ""
+    total: str = ""
+    account_number: str = ""
+    account_name: str = ""
+
+
+FIELD_PATTERNS = {
+    "invoice_number": [
+        r"\bInvoice[^\S\r\n]*(?:Number|No\.?|#)?[^\S\r\n]*[:#;\-][^\S\r\n]*#?[^\S\r\n]*([A-Z0-9][A-Z0-9\-\/]+)",
+        r"\bInv(?:oice)?[^\S\r\n]*[:#;\-][^\S\r\n]*#?[^\S\r\n]*([A-Z0-9][A-Z0-9\-\/]+)",
+    ],
+    "date": [
+        r"\b(?:Invoice\s*)?Date\s*[:#-]?\s*([0-3]?\d[./-][01]?\d[./-](?:\d{4}|\d{2}))",
+        r"\b([0-3]?\d[./-][01]?\d[./-](?:\d{4}|\d{2}))\b",
+        r"\b([A-Z][a-z]{2,8}[.\s]+\d{1,2}[,\s.]+\d{4})\b",
+        r"\b([A-Z][a-z]{2,8}\s+\d{1,2},?\s+\d{4})\b",
+    ],
+    "subtotal": [
+        r"\bSub\s*[- ]?\s*Total\s*[:#-]?\s*(?:Rs\.?|INR|\$)?\s*([0-9,]+(?:\.\d{1,2})?)",
+        r"\bAmount\s*Before\s*Tax\s*[:#-]?\s*(?:Rs\.?|INR|\$)?\s*([0-9,]+(?:\.\d{1,2})?)",
+    ],
+    "tax": [
+        r"\b(?:Tax|GST|CGST|SGST|VAT)\s*[:#-]?\s*(?:Rs\.?|INR|\$)?\s*([0-9,]+(?:\.\d{1,2})?%?)",
+    ],
+    "total": [
+        r"\bAmount\s*Due\s*[:#-]?\s*(?:Rs\.?|INR|\$|%)?\s*([0-9,]+(?:\.\d{1,2})?)",
+        r"\bGrand\s*Total\s*[:#-]?\s*(?:Rs\.?|INR|\$)?\s*([0-9,]+(?:\.\d{1,2})?)",
+        r"\bTotal\s*(?:Amount|Due)?\s*[:#-]?\s*(?:Rs\.?|INR|\$)?\s*([0-9,]+(?:\.\d{1,2})?)",
+    ],
+    "account_number": [
+        r"\bAccount\s*(?:Number|No\.?)\s*[:#.-]?\s*([0-9][0-9 \-]{3,})",
+        r"\bA\/c\s*No\.?\s*[:#.-]?\s*([0-9][0-9 \-]{3,})",
+    ],
+    "account_name": [
+        r"\bAccount\s*Name\s*[:#-]?\s*([^\n\r]+)",
+        r"\bA\/c\s*Name\s*[:#-]?\s*([^\n\r]+)",
+        r"\bBill\s*To\s*[:#-]?\s*([^\n\r]+)",
+    ],
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Extract invoice fields from image files with OCR and export them to Excel."
+    )
+    parser.add_argument(
+        "-i",
+        "--input",
+        default=".",
+        help="Image file or directory containing invoice images. Defaults to the current folder.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Excel output path. Defaults to extracted_invoice_data_<timestamp>.xlsx.",
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Search directories recursively for invoice images.",
+    )
+    parser.add_argument(
+        "--tesseract-cmd",
+        default=os.environ.get("TESSERACT_CMD"),
+        help="Path to the Tesseract executable. Can also be set with TESSERACT_CMD.",
+    )
+    parser.add_argument(
+        "--lang",
+        default="eng",
+        help="Tesseract language code. Defaults to eng.",
+    )
+    parser.add_argument(
+        "--debug-text",
+        action="store_true",
+        help="Write OCR text files next to the Excel output for troubleshooting.",
+    )
+    return parser.parse_args()
+
+
+def import_runtime_dependencies():
+    try:
+        import cv2
+        import pytesseract
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font
+    except ImportError as exc:
+        missing = exc.name or "a required package"
+        raise SystemExit(
+            f"Missing dependency: {missing}. Install project dependencies with: "
+            "python -m pip install -r requirements.txt"
+        ) from exc
+
+    return cv2, pytesseract, Workbook, Alignment, Font
+
+
+def configure_tesseract(pytesseract_module, tesseract_cmd: str | None) -> None:
+    if tesseract_cmd:
+        if not Path(tesseract_cmd).exists():
+            raise SystemExit(f"Tesseract executable was not found: {tesseract_cmd}")
+        pytesseract_module.pytesseract.tesseract_cmd = tesseract_cmd
+        return
+
+    if shutil.which("tesseract"):
+        return
+
+    default_windows_paths = [
+        Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
+        Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
+    ]
+    for path in default_windows_paths:
+        if path.exists():
+            pytesseract_module.pytesseract.tesseract_cmd = str(path)
+            return
+
+    raise SystemExit(
+        "Tesseract OCR is not installed or not on PATH. Install it, then rerun with "
+        "--tesseract-cmd C:\\Path\\To\\tesseract.exe or set TESSERACT_CMD."
+    )
+
+
+def discover_images(input_path: Path, recursive: bool) -> list[Path]:
+    if input_path.is_file():
+        if input_path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+            raise SystemExit(f"Unsupported image type: {input_path}")
+        return [input_path]
+
+    if not input_path.exists():
+        raise SystemExit(f"Input path does not exist: {input_path}")
+
+    pattern = "**/*" if recursive else "*"
+    images = [
+        path
+        for path in input_path.glob(pattern)
+        if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+    ]
+    return sorted(images)
+
+
+def preprocess_image(image_path: Path, cv2_module):
+    image = cv2_module.imread(str(image_path), cv2_module.IMREAD_GRAYSCALE)
+    if image is None:
+        raise ValueError("OpenCV could not read the image")
+
+    image = cv2_module.resize(image, None, fx=2, fy=2, interpolation=cv2_module.INTER_CUBIC)
+    image = cv2_module.fastNlMeansDenoising(image, None, 12, 7, 21)
+    image = cv2_module.adaptiveThreshold(
+        image,
+        255,
+        cv2_module.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2_module.THRESH_BINARY,
+        31,
+        10,
+    )
     return image
 
-# ✅ Extract field using multiple regex patterns
-def extract_field(text, patterns):
+
+def normalize_text(text: str) -> str:
+    text = text.replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def clean_value(value: str) -> str:
+    value = re.sub(r"\s+", " ", value).strip(" :-#\t")
+    return value.strip()
+
+
+def extract_field(text: str, patterns: Iterable[str]) -> str:
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if match:
-            return match.group(1).strip()
-    return ''
+            return clean_value(match.group(1))
+    return ""
 
-# ✅ Define invoice folder path
-invoice_folder = r'C:\Users\Lenovo\pythonProjectinvoiceExtractor\invoices'
 
-# ✅ Define Excel output file path with timestamp
-output_file = f"extracted_invoice_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+def extract_invoice_data(filename: str, text: str) -> InvoiceData:
+    text = normalize_text(text)
+    values = {
+        field_name: extract_field(text, patterns)
+        for field_name, patterns in FIELD_PATTERNS.items()
+    }
+    return InvoiceData(filename=filename, **values)
 
-# ✅ Set up Excel workbook
-wb = Workbook()
-ws = wb.active
-ws.title = 'Invoices'
-headers = ['Filename', 'Invoice Number', 'Date', 'Subtotal', 'Tax', 'Account Number', 'Account Name']
-ws.append(headers)
 
-# ✅ Loop through invoice images
-for filename in os.listdir(invoice_folder):
-    if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-        filepath = os.path.join(invoice_folder, filename)
-        print(f"🔍 Processing {filepath}")
+def ocr_image(image_path: Path, cv2_module, pytesseract_module, lang: str) -> str:
+    processed = preprocess_image(image_path, cv2_module)
+    return pytesseract_module.image_to_string(processed, lang=lang, config="--psm 6")
 
-        # OCR with preprocessing
-        processed = preprocess_image(filepath)
-        text = pytesseract.image_to_string(processed)
 
-        # Field extraction
-        invoice_number = extract_field(text, [r'Invoice\s*#?:?\s*(\d+)', r'Invoice\s*No[:\s]*([0-9]+)'])
-        date = extract_field(text, [r'Date[:\s]*(\d{2}[./-]\d{2}[./-]\d{4})', r'(\d{2}[./-]\d{2}[./-]\d{4})'])
-        subtotal = extract_field(text, [r'Sub[-\s]?Total[:\s]*([\d.,]+)'])
-        tax = extract_field(text, [r'Tax[:\s]*([\d.,%]+)', r'GST[:\s]*([\d.,%]+)'])
-        account_number = extract_field(text, [r'Account\s*Number[:\s]*([\d ]+)', r'A/c\s*No[:\s]*([\d ]+)'])
-        account_name = extract_field(text, [r'A/c\s*Name[:\s]*(.+)', r'Account\s*Name[:\s]*(.+)'])
+def build_output_path(output_arg: str | None) -> Path:
+    if output_arg:
+        return Path(output_arg)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Path(f"extracted_invoice_data_{timestamp}.xlsx")
 
-        # Append to Excel
-        ws.append([filename, invoice_number, date, subtotal, tax, account_number, account_name])
 
-# ✅ Apply Excel formatting
-for col in ws.columns:
-    max_length = max(len(str(cell.value or '')) for cell in col)
-    ws.column_dimensions[col[0].column_letter].width = max_length + 5
+def write_debug_text(output_path: Path, image_path: Path, text: str) -> None:
+    debug_dir = output_path.with_name(f"{output_path.stem}_ocr_text")
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    debug_file = debug_dir / f"{image_path.stem}.txt"
+    debug_file.write_text(text, encoding="utf-8")
 
-for cell in ws[1]:
-    cell.font = Font(bold=True)
-    cell.alignment = Alignment(horizontal='center')
 
-# ✅ Save Excel file
-wb.save(output_file)
-print(f"✅ Data extraction complete. Saved to {output_file}")
+def write_workbook(rows: list[InvoiceData], output_path: Path, workbook_classes) -> None:
+    Workbook, Alignment, Font = workbook_classes
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Invoices"
+
+    headers = [
+        "Filename",
+        "Invoice Number",
+        "Date",
+        "Subtotal",
+        "Tax",
+        "Total",
+        "Account Number",
+        "Account Name",
+    ]
+    worksheet.append(headers)
+
+    for row in rows:
+        values = asdict(row)
+        worksheet.append(
+            [
+                values["filename"],
+                values["invoice_number"],
+                values["date"],
+                values["subtotal"],
+                values["tax"],
+                values["total"],
+                values["account_number"],
+                values["account_name"],
+            ]
+        )
+
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+
+    for column in worksheet.columns:
+        max_length = max(len(str(cell.value or "")) for cell in column)
+        worksheet.column_dimensions[column[0].column_letter].width = min(max_length + 4, 45)
+
+    workbook.save(output_path)
+
+
+def main() -> int:
+    args = parse_args()
+    input_path = Path(args.input).expanduser().resolve()
+    output_path = build_output_path(args.output).expanduser().resolve()
+
+    cv2_module, pytesseract_module, Workbook, Alignment, Font = import_runtime_dependencies()
+    configure_tesseract(pytesseract_module, args.tesseract_cmd)
+
+    image_paths = discover_images(input_path, args.recursive)
+    if not image_paths:
+        print(f"No invoice images found in {input_path}", file=sys.stderr)
+        return 1
+
+    extracted_rows: list[InvoiceData] = []
+    failures: list[tuple[Path, str]] = []
+
+    for image_path in image_paths:
+        print(f"Processing {image_path}")
+        try:
+            text = ocr_image(image_path, cv2_module, pytesseract_module, args.lang)
+            if args.debug_text:
+                write_debug_text(output_path, image_path, text)
+            extracted_rows.append(extract_invoice_data(image_path.name, text))
+        except Exception as exc:
+            failures.append((image_path, str(exc)))
+            extracted_rows.append(InvoiceData(filename=image_path.name))
+
+    write_workbook(extracted_rows, output_path, (Workbook, Alignment, Font))
+
+    print(f"Saved {len(extracted_rows)} invoice rows to {output_path}")
+    if failures:
+        print("Some files could not be processed:", file=sys.stderr)
+        for image_path, error in failures:
+            print(f"- {image_path}: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
