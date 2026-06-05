@@ -1,13 +1,25 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
-from dataclasses import asdict, dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+
+@dataclass
+class InvoiceLineItem:
+    description: str
+    quantity: str = ""
+    unit_price: str = ""
+    tax: str = ""
+    total: str = ""
+    raw_text: str = ""
 
 
 @dataclass
@@ -20,41 +32,131 @@ class InvoiceData:
     total: str = ""
     account_number: str = ""
     account_name: str = ""
+    source_path: str = ""
+    source_hash: str = ""
+    duplicate: bool = False
+    duplicate_reason: str = ""
+    validation_status: str = "unknown"
+    validation_issues: list[str] = field(default_factory=list)
+    line_items: list[InvoiceLineItem] = field(default_factory=list)
 
 
-FIELD_PATTERNS = {
-    "invoice_number": [
-        r"\bInvoice[^\S\r\n]*(?:Number|No\.?|#)?[^\S\r\n]*[:#;\-][^\S\r\n]*#?[^\S\r\n]*([A-Z0-9][A-Z0-9\-\/]+)",
-        r"\bInv(?:oice)?[^\S\r\n]*[:#;\-][^\S\r\n]*#?[^\S\r\n]*([A-Z0-9][A-Z0-9\-\/]+)",
-    ],
-    "date": [
-        r"\b(?:Invoice\s*)?Date\s*[:#-]?\s*([0-3]?\d[./-][01]?\d[./-](?:\d{4}|\d{2}))",
-        r"\b([0-3]?\d[./-][01]?\d[./-](?:\d{4}|\d{2}))\b",
-        r"\b([A-Z][a-z]{2,8}[.\s]+\d{1,2}[,\s.]+\d{4})\b",
-        r"\b([A-Z][a-z]{2,8}\s+\d{1,2},?\s+\d{4})\b",
-    ],
-    "subtotal": [
-        r"\bSub\s*[- ]?\s*Total\s*[:#-]?\s*(?:Rs\.?|INR|\$)?\s*([0-9,]+(?:\.\d{1,2})?)",
-        r"\bAmount\s*Before\s*Tax\s*[:#-]?\s*(?:Rs\.?|INR|\$)?\s*([0-9,]+(?:\.\d{1,2})?)",
-    ],
-    "tax": [
-        r"\b(?:Tax|GST|CGST|SGST|VAT)\s*[:#-]?\s*(?:Rs\.?|INR|\$)?\s*([0-9,]+(?:\.\d{1,2})?%?)",
-    ],
-    "total": [
-        r"\bAmount\s*Due\s*[:#-]?\s*(?:Rs\.?|INR|\$|%)?\s*([0-9,]+(?:\.\d{1,2})?)",
-        r"\bGrand\s*Total\s*[:#-]?\s*(?:Rs\.?|INR|\$)?\s*([0-9,]+(?:\.\d{1,2})?)",
-        r"\bTotal\s*(?:Amount|Due)?\s*[:#-]?\s*(?:Rs\.?|INR|\$)?\s*([0-9,]+(?:\.\d{1,2})?)",
-    ],
-    "account_number": [
-        r"\bAccount\s*(?:Number|No\.?)\s*[:#.-]?\s*([0-9][0-9 \-]{3,})",
-        r"\bA\/c\s*No\.?\s*[:#.-]?\s*([0-9][0-9 \-]{3,})",
-    ],
-    "account_name": [
-        r"\bAccount\s*Name\s*[:#-]?\s*([^\n\r]+)",
-        r"\bA\/c\s*Name\s*[:#-]?\s*([^\n\r]+)",
-        r"\bBill\s*To\s*[:#-]?\s*([^\n\r]+)",
-    ],
+@dataclass
+class OcrDocument:
+    text: str
+    lines: list[str]
+
+
+FIELD_SPECS = {
+    "invoice_number": {
+        "labels": ["invoice number", "invoice no", "invoice #", "invoice"],
+        "patterns": [
+            r"\bInvoice[^\S\r\n]*(?:Number|No\.?|#)?[^\S\r\n]*[:#;\-]?[^\S\r\n]*#?[^\S\r\n]*([A-Z0-9][A-Z0-9\-\/]+)\b",
+            r"\bInv(?:oice)?[^\S\r\n]*[:#;\-]?[^\S\r\n]*#?[^\S\r\n]*([A-Z0-9][A-Z0-9\-\/]+)\b",
+        ],
+    },
+    "date": {
+        "labels": ["invoice date", "date"],
+        "patterns": [
+            r"\b(?:Invoice\s*)?Date\s*[:#-]?\s*([0-3]?\d[./-][01]?\d[./-](?:\d{4}|\d{2}))\b",
+            r"\b([0-3]?\d[./-][01]?\d[./-](?:\d{4}|\d{2}))\b",
+            r"\b([A-Z]{3,9}[.\s]+\d{1,2}[,\s.]+\d{4})\b",
+            r"\b([A-Z][a-z]{2,8}[.\s]+\d{1,2}[,\s.]+\d{4})\b",
+            r"\b([A-Z][a-z]{2,8}\s+\d{1,2},?\s+\d{4})\b",
+        ],
+    },
+    "subtotal": {
+        "labels": ["subtotal", "sub total", "amount before tax"],
+        "patterns": [
+            r"\bSub\s*[- ]?\s*Total\s*[:#-]?\s*(?:Rs\.?|INR|\$|₹)?\s*([~%$₹]?[0-9,]+(?:\.\d{1,2})?)\b",
+            r"\bAmount\s*Before\s*Tax\s*[:#-]?\s*(?:Rs\.?|INR|\$|₹)?\s*([~%$₹]?[0-9,]+(?:\.\d{1,2})?)\b",
+        ],
+    },
+    "tax": {
+        "labels": ["tax", "gst", "cgst", "sgst", "vat"],
+        "patterns": [
+            r"\b(?:Tax|GST|CGST|SGST|VAT)\s*[:#-]?\s*(?:Rs\.?|INR|\$|₹)?\s*([0-9,]+(?:\.\d{1,2})?%?)",
+        ],
+    },
+    "total": {
+        "labels": ["grand total", "amount due", "total amount", "total due", "balance due", "total"],
+        "patterns": [
+            r"\b(?:Grand\s*Total|Amount\s*Due|Total\s*Amount|Total\s*Due|Balance\s*Due|Total)\s*[:#;\-]?\s*(?:Rs\.?|INR|\$|₹)?\s*([~%$₹]?[0-9,]+(?:\.\d{1,2})?)\b",
+        ],
+    },
+    "account_number": {
+        "labels": ["account number", "account no", "a/c no", "bank account no"],
+        "patterns": [
+            r"\bAccount\s*(?:Number|No\.?)\s*[:#.-]?\s*([A-Z0-9][A-Z0-9 \-]{3,})\b",
+            r"\bA\/c\s*No\.?\s*[:#.-]?\s*([A-Z0-9][A-Z0-9 \-]{3,})\b",
+        ],
+    },
+    "account_name": {
+        "labels": ["account name", "a/c name", "beneficiary name", "payee"],
+        "patterns": [
+            r"\bAccount\s*Name\s*[:#-]?\s*([^\n\r]+)",
+            r"\bA\/c\s*Name\s*[:#-]?\s*([^\n\r]+)",
+            r"\bBill\s*To\s*[:#-]?\s*([^\n\r]+)",
+        ],
+    },
 }
+
+SUMMARY_STOP_KEYWORDS = [
+    "subtotal",
+    "sub total",
+    "grand total",
+    "amount due",
+    "total amount",
+    "balance due",
+    "bank",
+    "account number",
+    "account no",
+    "account name",
+    "invoice no",
+    "invoice number",
+    "invoice date",
+    "bill to",
+    "ship to",
+    "notes",
+    "terms",
+    "pay by",
+    "due date",
+]
+
+TABLE_HEADER_KEYWORDS = [
+    "description",
+    "item",
+    "qty",
+    "quantity",
+    "unit price",
+    "price",
+    "amount",
+    "line total",
+]
+
+LINE_ITEM_PATTERNS = [
+    re.compile(
+        r"^(?P<description>.+?)\s+(?P<quantity>\d+(?:\.\d+)?)\s+"
+        r"(?P<unit_price>[~%$₹]?[0-9,]+(?:\.\d{1,2})?)\s+"
+        r"(?P<line_total>[~%$₹]?[0-9,]+(?:\.\d{1,2})?)$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?P<description>.+?)\s+(?P<unit_price>[~%$₹]?[0-9,]+(?:\.\d{1,2})?)\s+"
+        r"(?P<quantity>\d+(?:\.\d+)?)\s+"
+        r"(?P<line_total>[~%$₹]?[0-9,]+(?:\.\d{1,2})?)$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?P<description>.+?)\s+(?P<quantity>\d+(?:\.\d+)?)\s+"
+        r"(?P<line_total>[~%$₹]?[0-9,]+(?:\.\d{1,2})?)$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?P<description>.+?)\s+(?P<line_total>[~%$₹]?[0-9,]+(?:\.\d{1,2})?)$",
+        re.IGNORECASE,
+    ),
+]
 
 
 def import_runtime_dependencies():
@@ -141,6 +243,14 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+def normalize_line(line: str) -> str:
+    return re.sub(r"\s+", " ", line).strip()
+
+
+def split_text_lines(text: str) -> list[str]:
+    return [normalize_line(line) for line in normalize_text(text).split("\n") if normalize_line(line)]
+
+
 def clean_value(value: str) -> str:
     value = re.sub(r"\s+", " ", value).strip(" :-#\t")
     return value.strip()
@@ -154,61 +264,190 @@ def extract_field(text: str, patterns: Iterable[str]) -> str:
     return ""
 
 
-def extract_invoice_data(filename: str, text: str) -> InvoiceData:
-    text = normalize_text(text)
+def _line_has_keywords(line: str, keywords: Sequence[str]) -> bool:
+    lowered = line.lower()
+    return any(keyword in lowered for keyword in keywords)
+
+
+def extract_field_from_document(
+    lines: list[str],
+    text: str,
+    labels: Sequence[str],
+    patterns: Sequence[str],
+    *,
+    search_from_bottom: bool = False,
+    lookaround: int = 2,
+) -> str:
+    indexed_lines = list(enumerate(lines))
+    if search_from_bottom:
+        indexed_lines = list(reversed(indexed_lines))
+
+    for index, line in indexed_lines:
+        if _line_has_keywords(line, labels):
+            match = extract_field(line, patterns)
+            if match:
+                return match
+
+            neighbor_range = range(1, lookaround + 1)
+            for offset in neighbor_range:
+                neighbor_index = index - offset if search_from_bottom else index + offset
+                if 0 <= neighbor_index < len(lines):
+                    neighbor_line = lines[neighbor_index]
+                    neighbor_match = extract_field(neighbor_line, patterns)
+                    if neighbor_match:
+                        return neighbor_match
+
+    return extract_field(text, patterns)
+
+
+def _strip_currency_markers(value: str) -> str:
+    return re.sub(r"^[~%$₹]+\s*", "", value).strip()
+
+
+def _clean_line_item_description(value: str) -> str:
+    cleaned = clean_value(value)
+    cleaned = re.sub(r"\b(?:INR|USD|EUR|GBP|Rs\.?|₹|\$)\b", "", cleaned).strip()
+    return cleaned
+
+
+def parse_invoice_line_item(line: str) -> InvoiceLineItem | None:
+    cleaned = normalize_line(line)
+    if not cleaned:
+        return None
+    lowered = cleaned.lower()
+    if _line_has_keywords(lowered, SUMMARY_STOP_KEYWORDS):
+        return None
+
+    for pattern in LINE_ITEM_PATTERNS:
+        match = pattern.match(cleaned)
+        if not match:
+            continue
+
+        groups = match.groupdict()
+        description = _clean_line_item_description(groups.get("description", ""))
+        if not description:
+            continue
+
+        return InvoiceLineItem(
+            description=description,
+            quantity=_strip_currency_markers(groups.get("quantity", "")),
+            unit_price=_strip_currency_markers(groups.get("unit_price", "")),
+            tax=_strip_currency_markers(groups.get("tax", "")),
+            total=_strip_currency_markers(groups.get("line_total", "")),
+            raw_text=cleaned,
+        )
+
+    return None
+
+
+def extract_line_items_from_lines(lines: list[str]) -> list[InvoiceLineItem]:
+    start_index = 0
+    for index, line in enumerate(lines):
+        if sum(1 for keyword in TABLE_HEADER_KEYWORDS if keyword in line.lower()) >= 2:
+            start_index = index + 1
+            break
+
+    items: list[InvoiceLineItem] = []
+    for line in lines[start_index:]:
+        lowered = line.lower()
+        if _line_has_keywords(lowered, SUMMARY_STOP_KEYWORDS):
+            break
+
+        item = parse_invoice_line_item(line)
+        if item:
+            items.append(item)
+
+    return items
+
+
+def extract_invoice_data(filename: str, text: str, ocr_lines: Sequence[str] | None = None) -> InvoiceData:
+    normalized_text = normalize_text(text)
+    lines = [normalize_line(line) for line in (ocr_lines or split_text_lines(text))]
+    lines = [line for line in lines if line]
+
     values = {
-        field_name: extract_field(text, patterns)
-        for field_name, patterns in FIELD_PATTERNS.items()
+        field_name: extract_field_from_document(
+            lines,
+            normalized_text,
+            spec["labels"],
+            spec["patterns"],
+            search_from_bottom=(field_name == "total"),
+        )
+        for field_name, spec in FIELD_SPECS.items()
     }
-    return InvoiceData(filename=filename, **values)
+
+    return InvoiceData(
+        filename=filename,
+        invoice_number=values["invoice_number"],
+        date=values["date"],
+        subtotal=values["subtotal"],
+        tax=values["tax"],
+        total=values["total"],
+        account_number=values["account_number"],
+        account_name=values["account_name"],
+        line_items=extract_line_items_from_lines(lines),
+    )
+
+
+def ocr_document(image_path: Path, cv2_module, pytesseract_module, lang: str) -> OcrDocument:
+    processed = preprocess_image(image_path, cv2_module)
+    text = pytesseract_module.image_to_string(processed, lang=lang, config="--psm 6")
+
+    try:
+        data = pytesseract_module.image_to_data(
+            processed,
+            lang=lang,
+            config="--psm 6",
+            output_type=pytesseract_module.Output.DICT,
+        )
+    except Exception:
+        return OcrDocument(text=text, lines=split_text_lines(text))
+
+    grouped: dict[tuple[int, int, int], list[tuple[int, str]]] = defaultdict(list)
+    for index, word in enumerate(data.get("text", [])):
+        token = normalize_line(word)
+        if not token:
+            continue
+
+        try:
+            confidence = float(data.get("conf", ["-1"])[index])
+        except (TypeError, ValueError, IndexError):
+            confidence = -1.0
+        if confidence < 0:
+            continue
+
+        key = (
+            int(data.get("block_num", [0])[index]),
+            int(data.get("par_num", [0])[index]),
+            int(data.get("line_num", [0])[index]),
+        )
+        grouped[key].append((int(data.get("left", [0])[index]), token))
+
+    lines = []
+    for key in sorted(grouped):
+        words = grouped[key]
+        words.sort(key=lambda item: item[0])
+        line = normalize_line(" ".join(token for _, token in words))
+        if line:
+            lines.append(line)
+
+    if not lines:
+        lines = split_text_lines(text)
+
+    return OcrDocument(text=text, lines=lines)
 
 
 def ocr_image(image_path: Path, cv2_module, pytesseract_module, lang: str) -> str:
-    processed = preprocess_image(image_path, cv2_module)
-    return pytesseract_module.image_to_string(processed, lang=lang, config="--psm 6")
+    return ocr_document(image_path, cv2_module, pytesseract_module, lang).text
 
 
-def write_workbook(rows: list[InvoiceData], output_path: Path, workbook_classes) -> None:
-    Workbook, Alignment, Font = workbook_classes
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    workbook = Workbook()
-    worksheet = workbook.active
-    worksheet.title = "Invoices"
 
-    headers = [
-        "Filename",
-        "Invoice Number",
-        "Date",
-        "Subtotal",
-        "Tax",
-        "Total",
-        "Account Number",
-        "Account Name",
-    ]
-    worksheet.append(headers)
-
-    for row in rows:
-        values = asdict(row)
-        worksheet.append(
-            [
-                values["filename"],
-                values["invoice_number"],
-                values["date"],
-                values["subtotal"],
-                values["tax"],
-                values["total"],
-                values["account_number"],
-                values["account_name"],
-            ]
-        )
-
-    for cell in worksheet[1]:
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center")
-
-    for column in worksheet.columns:
-        max_length = max(len(str(cell.value or "")) for cell in column)
-        worksheet.column_dimensions[column[0].column_letter].width = min(max_length + 4, 45)
-
-    workbook.save(output_path)
+def bytes_sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()

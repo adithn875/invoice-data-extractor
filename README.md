@@ -1,33 +1,39 @@
 # Invoice Data Extractor
 
-Extract invoice fields from images with OCR and export the results to Excel.
+Extract invoice fields from images with OCR, validate totals, store processing history, and export the results to Excel, CSV, or JSON.
 
 ## Project Structure
 
 ```text
 invoice-data-extractor/
-├── app/                         # Streamlit frontend
-│   └── streamlit_app.py
-├── examples/
-│   └── invoices/                # Sample invoice images
-├── src/
-│   └── invoice_data_extractor/  # Reusable Python package
-│       ├── __init__.py
-│       ├── cli.py
-│       └── extractor.py
-├── tests/                       # Unit tests
-├── pyproject.toml               # Package metadata and CLI entry point
-├── requirements.txt             # Runtime dependencies
-└── README.md
+|-- app/
+|   `-- streamlit_app.py
+|-- examples/
+|   `-- invoices/
+|-- src/
+|   `-- invoice_data_extractor/
+|       |-- __init__.py
+|       |-- cli.py
+|       |-- export.py
+|       |-- extractor.py
+|       |-- storage.py
+|       `-- validation.py
+|-- tests/
+|-- pyproject.toml
+|-- requirements.txt
+`-- README.md
 ```
 
 ## Features
 
-- Processes PNG, JPG, JPEG, TIFF, and BMP invoice images.
-- Extracts invoice number, date, subtotal, tax, total, account number, and account name.
-- Exports results to a formatted `.xlsx` workbook.
-- Provides both a command-line interface and a Streamlit browser UI.
-- Supports custom Tesseract executable paths.
+- OCR via Tesseract with layout-aware line reconstruction.
+- Keyword-proximity extraction for invoice metadata.
+- Line-item extraction for description, quantity, unit price, tax, and total.
+- Validation rules for subtotal, tax, total, and line-item totals.
+- Duplicate detection by invoice number and uploaded file hash.
+- SQLite history storage for processed invoices.
+- Export to Excel, CSV, or JSON.
+- Streamlit frontend for upload, preview, validation, and download.
 
 ## Requirements
 
@@ -46,15 +52,9 @@ For local development, install the package in editable mode:
 python -m pip install -e .
 ```
 
-Install Tesseract:
-
-- Windows: install Tesseract OCR and note the `tesseract.exe` path.
-- macOS: `brew install tesseract`
-- Linux: `sudo apt install tesseract-ocr`
-
 ## Command Line Usage
 
-After editable install:
+Run the extractor against the sample invoices:
 
 ```bash
 invoice-extract
@@ -62,29 +62,26 @@ invoice-extract
 
 The default input folder is `examples/invoices`.
 
-Run against a custom folder:
+Export as CSV or JSON:
 
 ```bash
-invoice-extract --input path/to/invoices --output extracted_invoice_data.xlsx
+invoice-extract --format csv
+invoice-extract --format json
 ```
 
-Run recursively:
+Run against your own folder:
 
 ```bash
 invoice-extract --input path/to/invoices --recursive
 ```
 
-On Windows, if Tesseract is not on `PATH`, pass the executable path:
+Set a custom Tesseract executable if needed:
 
 ```bash
 invoice-extract --tesseract-cmd "C:\Program Files\Tesseract-OCR\tesseract.exe"
 ```
 
-You can also set:
-
-```bash
-set TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
-```
+The invoice history database is stored in `.invoice_history.sqlite3` by default.
 
 ## Streamlit App
 
@@ -94,7 +91,14 @@ Launch the browser UI:
 python -m streamlit run app/streamlit_app.py
 ```
 
-Use the sidebar to enter the Tesseract executable path if it is not already on `PATH`.
+The app lets you:
+
+- Upload multiple invoice images.
+- View extracted summary fields and line items.
+- Check validation and duplicate status.
+- Choose an export format.
+- Download the exported file set.
+- Review recent processing history from SQLite.
 
 ## Tests
 
