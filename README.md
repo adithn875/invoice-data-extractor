@@ -1,56 +1,83 @@
 # Invoice Data Extractor
 
-Extract invoice fields from image files with OCR and export the results to an Excel workbook.
+Extract invoice fields from images with OCR and export the results to Excel.
+
+## Project Structure
+
+```text
+invoice-data-extractor/
+├── app/                         # Streamlit frontend
+│   └── streamlit_app.py
+├── examples/
+│   └── invoices/                # Sample invoice images
+├── src/
+│   └── invoice_data_extractor/  # Reusable Python package
+│       ├── __init__.py
+│       ├── cli.py
+│       └── extractor.py
+├── tests/                       # Unit tests
+├── pyproject.toml               # Package metadata and CLI entry point
+├── requirements.txt             # Runtime dependencies
+└── README.md
+```
 
 ## Features
 
 - Processes PNG, JPG, JPEG, TIFF, and BMP invoice images.
 - Extracts invoice number, date, subtotal, tax, total, account number, and account name.
-- Writes results to a formatted `.xlsx` file.
-- Supports a single image, a folder of images, or recursive folder scanning.
-- Allows custom Tesseract executable paths through an argument or environment variable.
+- Exports results to a formatted `.xlsx` workbook.
+- Provides both a command-line interface and a Streamlit browser UI.
+- Supports custom Tesseract executable paths.
 
 ## Requirements
 
 - Python 3.10+
 - Tesseract OCR installed on your system
 
-Install Python packages:
+Install Python dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
+For local development, install the package in editable mode:
+
+```bash
+python -m pip install -e .
+```
+
 Install Tesseract:
 
-- Windows: install from the official UB Mannheim Windows builds, then note the `tesseract.exe` path.
+- Windows: install Tesseract OCR and note the `tesseract.exe` path.
 - macOS: `brew install tesseract`
 - Linux: `sudo apt install tesseract-ocr`
 
-## Usage
+## Command Line Usage
 
-Run against the sample images in the project root:
+After editable install:
 
 ```bash
-python main.py
+invoice-extract
 ```
 
-Run against a folder:
+The default input folder is `examples/invoices`.
+
+Run against a custom folder:
 
 ```bash
-python main.py --input path/to/invoices --output extracted_invoice_data.xlsx
+invoice-extract --input path/to/invoices --output extracted_invoice_data.xlsx
 ```
 
 Run recursively:
 
 ```bash
-python main.py --input path/to/invoices --recursive
+invoice-extract --input path/to/invoices --recursive
 ```
 
 On Windows, if Tesseract is not on `PATH`, pass the executable path:
 
 ```bash
-python main.py --tesseract-cmd "C:\Program Files\Tesseract-OCR\tesseract.exe"
+invoice-extract --tesseract-cmd "C:\Program Files\Tesseract-OCR\tesseract.exe"
 ```
 
 You can also set:
@@ -59,21 +86,18 @@ You can also set:
 set TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
 ```
 
-## Troubleshooting
-
-Use `--debug-text` to save OCR text files beside the Excel output. This helps tune regex patterns when an invoice layout is not detected correctly.
-
-```bash
-python main.py --debug-text
-```
-
 ## Streamlit App
 
-Install dependencies, then launch the browser UI:
+Launch the browser UI:
 
 ```bash
-python -m pip install -r requirements.txt
-python -m streamlit run streamlit_app.py
+python -m streamlit run app/streamlit_app.py
 ```
 
-Use the sidebar to enter a Tesseract executable path if it is not already on `PATH`.
+Use the sidebar to enter the Tesseract executable path if it is not already on `PATH`.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests
+```

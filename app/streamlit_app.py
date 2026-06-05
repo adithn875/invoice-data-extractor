@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import tempfile
 from dataclasses import asdict
-from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from main import (
+from invoice_data_extractor import (
     SUPPORTED_IMAGE_EXTENSIONS,
     InvoiceData,
     configure_tesseract,
@@ -19,10 +18,7 @@ from main import (
 )
 
 
-st.set_page_config(
-    page_title="Invoice Data Extractor",
-    layout="wide",
-)
+st.set_page_config(page_title="Invoice Data Extractor", layout="wide")
 
 
 def make_excel_download(rows: list[InvoiceData]) -> bytes:
@@ -38,8 +34,7 @@ def make_excel_download(rows: list[InvoiceData]) -> bytes:
 
 
 def write_upload_to_temp(uploaded_file, temp_dir: Path) -> Path:
-    safe_name = Path(uploaded_file.name).name
-    target_path = temp_dir / safe_name
+    target_path = temp_dir / Path(uploaded_file.name).name
     target_path.write_bytes(uploaded_file.getbuffer())
     return target_path
 
@@ -95,7 +90,6 @@ def main() -> None:
     st.caption("Upload invoice images, extract key fields, and download the result as Excel.")
 
     tesseract_cmd, show_ocr_text = render_sidebar()
-
     allowed_extensions = sorted(ext.lstrip(".") for ext in SUPPORTED_IMAGE_EXTENSIONS)
     uploaded_files = st.file_uploader(
         "Upload invoice images",
@@ -121,7 +115,7 @@ def main() -> None:
     try:
         cv2_module, pytesseract_module, _, _, _ = import_runtime_dependencies()
         configure_tesseract(pytesseract_module, tesseract_cmd or None)
-    except SystemExit as exc:
+    except RuntimeError as exc:
         st.error(str(exc))
         return
 

@@ -1,6 +1,10 @@
+import sys
 import unittest
+from pathlib import Path
 
-from main import extract_invoice_data
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from invoice_data_extractor import extract_invoice_data
 
 
 class ExtractInvoiceDataTest(unittest.TestCase):
